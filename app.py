@@ -42,19 +42,43 @@ def clean_sql_query(sql_query):
     sql_query = re.sub(r'```sql|```', '', sql_query).strip()
     return sql_query
 
-# Get database schema: tables and columns
-def get_database_schema():
+# Get database schema: tables, columns, and foreign key relationships
+def get_database_schema_with_data():
     schema = []
     try:
         conn = mysql.connector.connect(**db_config)
         cursor = conn.cursor()
+
+        # Get the list of all tables
         cursor.execute("SHOW TABLES;")
         tables = [row[0] for row in cursor.fetchall()]
 
         for table in tables:
+            # Get column names for each table
             cursor.execute(f"SHOW COLUMNS FROM {table};")
             columns = [col[0] for col in cursor.fetchall()]
-            schema.append(f"{table}({', '.join(columns)})")
+            schema.append(f"Table: {table} ({', '.join(columns)})")
+
+            # Get some sample rows from each table
+            cursor.execute(f"SELECT * FROM {table} LIMIT 3;")
+            rows = cursor.fetchall()
+            if rows:
+                row_data = [dict(zip(columns, row)) for row in rows]
+                schema.append(f"Sample rows from {table}: {row_data}")
+            else:
+                schema.append(f"No data found in table: {table}")
+
+            # Get foreign key relationships
+            cursor.execute(f"""
+                SELECT k.column_name, k.referenced_table_name, k.referenced_column_name
+                FROM information_schema.key_column_usage k
+                WHERE k.table_name = '{table}' AND k.referenced_table_name IS NOT NULL;
+            """)
+            foreign_keys = cursor.fetchall()
+
+            for fk in foreign_keys:
+                column_name, referenced_table, referenced_column = fk
+                schema.append(f"Foreign Key: {column_name} -> {referenced_table}({referenced_column})")
 
         cursor.close()
         conn.close()
@@ -62,6 +86,7 @@ def get_database_schema():
         schema.append(f"Error: {e}")
     return schema
 
+# Endpoint to chat and execute queries
 @app.route('/chat', methods=['POST'])
 def chat():
     try:
@@ -69,11 +94,11 @@ def chat():
         if not user_question:
             return jsonify({"error": "Question is required"}), 400
 
-        # 1. Get schema
-        schema_info = get_database_schema()
+        # 1. Get schema including data and foreign keys
+        schema_info = get_database_schema_with_data()
         schema_text = "\n".join(schema_info)
 
-        # 2. Build prompt
+        # 2. Build the prompt for Gemini to convert the question to SQL query
         sql_prompt = f"""
 Convert this question into a valid MySQL SQL query.
 Use the following schema for accuracy:
@@ -88,11 +113,11 @@ User question: {user_question}
         if 'error' in gemini_response:
             return jsonify({"error": gemini_response['error'], "details": gemini_response.get('details')}), 500
 
-        # 3. Clean & extract SQL
+        # 3. Clean & extract SQL query
         sql_query = gemini_response['candidates'][0]['content']['parts'][0]['text']
         sql_query = clean_sql_query(sql_query)
 
-        # 4. Execute SQL
+        # 4. Execute the SQL query
         connection = mysql.connector.connect(**db_config)
         cursor = connection.cursor()
         try:
@@ -124,7 +149,7 @@ Only return the corrected SQL query.
         cursor.close()
         connection.close()
 
-        # 5. Optional: ask Gemini to explain results
+        # 5. Optional: ask Gemini to explain the results
         explain_prompt = f"Explain these SQL results in simple terms: {results}"
         explanation_response = ask_gemini(explain_prompt)
 
